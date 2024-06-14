@@ -2,7 +2,7 @@ import numpy as np
 from scipy.sparse import spdiags, dia_matrix, vstack
 from numba import jit, float64, int64, boolean
 
-@jit(float64[:,:](float64[:], int64, float64, float64, int64, float64, float64, float64, str), nopython=True, parallel=True)
+@jit(nopython=True, parallel=True)
 def beads(y, d, fc, r, Nit, lam0, lam1, lam2, pen):
     """BEADS: Baseline estimation and denoising using sparsity"""
     
