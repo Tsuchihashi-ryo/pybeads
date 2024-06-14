@@ -1,8 +1,9 @@
 import numpy as np
 from scipy.sparse import spdiags, dia_matrix, vstack
 from scipy.sparse.linalg import spsolve
+from numba import jit
 
-
+@jit(nopython=True)
 def beads(y, d, fc, r, Nit, lam0, lam1, lam2, pen, conv=None):
     """
 
@@ -106,7 +107,8 @@ def beads(y, d, fc, r, Nit, lam0, lam1, lam2, pen, conv=None):
     f = y - x - H(y - x)
 
     return x.squeeze(), f.squeeze(), cost
-
+    
+@jit(nopython=True)
 def BAfilt(d, fc, N):
     """
      --- local function ----
@@ -147,6 +149,7 @@ def BAfilt(d, fc, N):
 
 
 # left inverse
+@jit(nopython=True)
 def linv(a, b):
     '''
     a: sparse matrix
@@ -155,6 +158,7 @@ def linv(a, b):
     '''
     return spsolve(a.tocsc(), b).reshape(len(b), 1)
 
+@jit(nopython=True)
 def make_diff_matrices(N):
     e = np.ones((N-1, 1))
     # Here, dia_matrix is temporally converted to numpy array (dense matrix)
