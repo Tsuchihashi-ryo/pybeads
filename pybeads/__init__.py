@@ -1,170 +1,112 @@
 import numpy as np
 from scipy.sparse import spdiags, dia_matrix, vstack
-from scipy.sparse.linalg import spsolve
-from numba import jit
+from numba import jit, float64, boolean
 
-@jit(nopython=True)
-def beads(y, d, fc, r, Nit, lam0, lam1, lam2, pen, conv=None):
-    """
-
-    Baseline estimation and denoising using sparsity (BEADS)
-    The notation follows the rule in the original MATLAB code.
-
-    INPUT
-        y: Noisy observation.
-        d: Filter order (d = 1 or 2).
-        fc: Filter cut-off frequency (cycles/sample) (0 < fc < 0.5).
-        r: Asymmetry ratio for penalty function.
-        Nit: Number of iteration (usually 10 to 30 is enough).
-        lam0, lam1, lam2: Regularization parameters.
-        pen: Penalty function, 'L1_v1' or 'L1_v2'.
-
-        Original feature in this translation.
-        conv: Smoothing factor for differential matrix D. This stabilizes
-              outputs with slightly diffrent values for lam1 and lam2.
-              Must be integer. 3 to 5 is recommended.
-              
-
-    OUTPUT
-        x: Estimated sparse-derivative signal.
-        f: Estimated baseline.
-        cost: Cost function history
-
-    Reference:
-        Chromatogram baseline estimation and denoising using sparsity (BEADS)
-        Xiaoran Ning, Ivan W. Selesnick, Laurent Duval
-        Chemometrics and Intelligent Laboratory Systems (2014)
-        doi: 10.1016/j.chemolab.2014.09.014
-        Available online 30 September 2014
-
-    Maintainer:
-        Kotaro Saito
+@jit(float64[:,:](float64[:], int64, float64, float64, int64, float64, float64, float64, str), nopython=True, parallel=True)
+def beads(y, d, fc, r, Nit, lam0, lam1, lam2, pen):
+    """BEADS: Baseline estimation and denoising using sparsity"""
     
-    Initial translator:
-        Hisao Chun-Yi
-
-
-    """
-    # The following parameter may be altered.
-    EPS0 = 1e-6  # cost smoothing parameter for x (small positive value)
-    EPS1 = 1e-6  # cost smoothing parameter for derivatives(small positive value)
-
-    if pen is 'L1_v1':
-        phi = lambda xx: np.sqrt(np.power(abs(xx), 2) + EPS1)
-        wfun = lambda xx: 1. / np.sqrt(np.power(abs(xx), 2) + EPS1)
-    elif pen is 'L1_v2':
-        phi = lambda xx: abs(xx) - EPS1 * np.log(abs(xx) + EPS1)
-        wfun = lambda xx: 1. / (abs(xx) + EPS1)
-    else:
-        ValueError('penalty must be L1_v1, L1_v2')
+    EPS0 = 1e-6
+    EPS1 = 1e-6
     
-    #  equation (25)
-    theta = lambda xx: sum(xx[(xx > EPS0)]) - r * sum(xx[(xx < -EPS0)]) \
-                       + sum((1+r)/(4*EPS0) * xx[abs(xx) <= EPS0] ** 2 \
-                       + (1-r)/2 * xx[abs(xx) <= EPS0] + EPS0*(1+r)/4)
-
-    y = np.reshape(a=y, newshape=(len(y), 1))
-    x = y
-    cost = []
+    if pen == 'L1_v1':
+        @jit(float64(float64), nopython=True)
+        def phi(xx):
+            return np.sqrt(np.power(abs(xx), 2) + EPS1)
+        
+        @jit(float64(float64), nopython=True)
+        def wfun(xx):
+            return 1. / np.sqrt(np.power(abs(xx), 2) + EPS1)
+        
+    elif pen == 'L1_v2':
+        @jit(float64(float64), nopython=True)
+        def phi(xx):
+            return abs(xx) - EPS1 * np.log(abs(xx) + EPS1)
+        
+        @jit(float64(float64), nopython=True)
+        def wfun(xx):
+            return 1. / (abs(xx) + EPS1)
+    
+    @jit(float64(float64[:]), nopython=True, parallel=True)
+    def theta(xx):
+        sum_pos = 0.0
+        sum_neg = 0.0
+        sum_small = 0.0
+        for x in xx:
+            if x > EPS0:
+                sum_pos += x
+            elif x < -EPS0:
+                sum_neg += x
+            else:
+                sum_small += (1+r)/(4*EPS0) * x**2 + (1-r)/2 * x + EPS0*(1+r)/4
+        return sum_pos - r * sum_neg + sum_small
+    
     N = len(y)
     A, B = BAfilt(d, fc, N)
     H = lambda xx: B.dot(linv(A, xx))
     D1, D2 = make_diff_matrices(N)
-    D = vstack([D1, D2])  # scipy.sparse.vstack, not np.vstack
-    BTB = B.transpose().dot(B)
-
-    w = np.vstack(([lam1 * np.ones((N-1, 1)), lam2 * np.ones((N-2, 1))]))
-    b = (1-r) / 2 * np.ones((N, 1))
-    d = BTB.dot(linv(A, y)) - lam0 * A.transpose().dot(b)
-
-    gamma = np.ones((N, 1))
-
-    for i in range(1, Nit+1):
-        # print('step: ', i)
-        if type(conv) is int:
-            diff = np.convolve(D.dot(x.squeeze()), np.ones(conv)/conv, mode='same')[:, np.newaxis]
-        else:
-            diff = D.dot(x)
+    D = vstack([D1, D2])
+    BTB = B.T.dot(B)
+    
+    w = np.vstack(([lam1 * np.ones(N-1), lam2 * np.ones(N-2)])).astype(np.float64)
+    b = ((1-r) / 2 * np.ones(N)).astype(np.float64)
+    d = BTB.dot(linv(A, y.astype(np.float64))) - lam0 * A.T.dot(b)
+    
+    gamma = np.ones(N, dtype=np.float64)
+    x = y.astype(np.float64)
+    cost = np.zeros(Nit)
+    
+    for i in range(Nit):
+        diff = D.dot(x)
         wf = w * wfun(diff)
-        Lmda = spdiags(wf.transpose(), 0, 2 * N - 3, 2 * N - 3)
-
-        k = np.array(abs(x) > EPS0)  # return index 1d
-        gamma[~k] = ((1 + r) / 4) / abs(EPS0)
-        gamma[k] = ((1 + r) / 4) / abs(x[k])
-        Gamma = spdiags(gamma.transpose(), 0, N, N)
-
-        M = 2 * lam0 * Gamma + (D.transpose().dot(Lmda)).dot(D).transpose()
-        x = A.dot(linv(BTB + A.transpose().dot(M.dot(A)), d))
-
+        Lmda = spdiags(wf.T, 0, 2*N-3, 2*N-3)
+        
+        k = np.abs(x) > EPS0
+        gamma[~k] = ((1 + r) / 4) / EPS0
+        gamma[k] = ((1 + r) / 4) / np.abs(x[k])
+        Gamma = spdiags(gamma, 0, N, N)
+        
+        M = 2 * lam0 * Gamma + (D.T.dot(Lmda)).dot(D.T)
+        x = A.dot(linv(BTB + A.T.dot(M.dot(A)), d))
+        
         a = y - x
-        cost.append(
-            0.5 * sum(abs(H(a)) ** 2)
-            + lam0 * theta(x)
-            + lam1 * sum(phi(np.diff(x.squeeze())))
-            + lam2 * sum(phi(np.diff(x.squeeze(), 2))))
-        pass
-
+        cost[i] = 0.5 * np.sum(np.abs(H(a))**2) + lam0 * theta(x) + lam1 * np.sum(phi(np.diff(x))) + lam2 * np.sum(phi(np.diff(x, n=2)))
+    
     f = y - x - H(y - x)
-
-    return x.squeeze(), f.squeeze(), cost
     
-@jit(nopython=True)
-def BAfilt(d, fc, N):
-    """
-     --- local function ----
+    return np.asarray(x).reshape(-1, 1), np.asarray(f).reshape(-1, 1), cost
 
-    function [A, B] = BAfilt(d, fc, N)
-     [A, B] = BAfilt(d, fc, N)
-
-     Banded matrices for zero-phase high-pass filter.
-     The matrices are 'sparse' data type in MATLAB.
-     In this code, output matrices are scipy.sparse.dia_matrix.
-
-     INPUT
-       d  : degree of filter is 2d (use d = 1 or 2)
-       fc : cut-off frequency (normalized frequency, 0 < fc < 0.5)
-       N  : length of signal
-    """
-
-    b1 = [1, -1]
-    for i in range(1, d):
-        b1 = np.convolve(a=b1, v=[-1, 2, -1])
-
-    b = np.convolve(a=b1, v=[-1, 1])
-
-    omc = 2 * np.pi * fc
-    t = np.power(((1 - np.cos(omc)) / (1 + np.cos(omc))), d)
-
-    a = 1
-    for i in range(1, d+1):  # for i = 1:d
-        a = np.convolve(a=a, v=[1, 2, 1])
-    
-    a = b + t * a
-    xa, xb = (a*np.ones((N, 1))).transpose(), (b*np.ones((N, 1))).transpose()
-    dr = np.arange(-d, d+1)
-    A = spdiags(xa, dr, N, N)  # A: Symmetric banded matrix
-    B = spdiags(xb, dr, N, N)  # B: banded matrix
-
-    return A, B
-
-
-# left inverse
 @jit(nopython=True)
 def linv(a, b):
-    '''
-    a: sparse matrix
-    b: vector
-
-    '''
-    return spsolve(a.tocsc(), b).reshape(len(b), 1)
+    return np.linalg.spsolve_triangular(a.T, b, lower=True).reshape(-1, 1)
 
 @jit(nopython=True)
 def make_diff_matrices(N):
-    e = np.ones((N-1, 1))
-    # Here, dia_matrix is temporally converted to numpy array (dense matrix)
-    # because dia_matrix does not support element-wise subsitution.
-    D1 = spdiags(np.array([-e, e]).squeeze(), [0, 1], N-1, N).toarray()
-    D2 = spdiags(np.array([e, -2*e, e]).squeeze(), range(0, 3), N-2, N).toarray()
+    e = np.ones(N-1, dtype=np.float64)
+    D1 = spdiags([-e, e], [0, 1], N-1, N)
+    D2 = spdiags([e, -2*e, e], range(3), N-2, N)
     D1[-1, -1], D2[-1, -1] = 1., 1.
-    # convert them back to dia_matrix
-    return dia_matrix(D1), dia_matrix(D2)
+    return D1, D2
+
+@jit(nopython=True)  
+def BAfilt(d, fc, N):
+    b1 = np.array([1, -1], dtype=np.float64)
+    for i in range(d):
+        b1 = np.convolve(b1, [-1, 2, -1])
+    
+    b = np.convolve(b1, [-1, 1])
+    
+    omc = 2 * np.pi * fc
+    t = np.power(((1 - np.cos(omc)) / (1 + np.cos(omc))), d)
+    
+    a = np.array([1], dtype=np.float64)
+    for i in range(d):
+        a = np.convolve(a, [1, 2, 1])
+    
+    a = b + t * a
+    xa, xb = a, b
+    dr = np.arange(-d, d+1)
+    A = spdiags(xa, dr, N, N)
+    B = spdiags(xb, dr, N, N)
+    
+    return A, B
